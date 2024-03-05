@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <STM32FreeRTOS.h>
+#include <ES_CAN.h>
 
 // Constants
 const uint32_t interval = 100; // Display update interval
@@ -54,6 +55,13 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value)
   digitalWrite(REN_PIN, LOW);
 }
 
+struct
+{
+  std::bitset<32> inputs;
+  SemaphoreHandle_t mutex;
+  int knob3Rotation = 0;
+} sysState;
+
 void setRow(uint8_t x)
 {
   // Convert to 3 bit binary
@@ -93,9 +101,8 @@ const uint32_t stepSizes[12] = {
     calcStepSize(1),
     calcStepSize(2)};
 
-std::vector<String> Keys = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
-
 volatile uint32_t currentStepSize;
+volatile uint32_t currentKnob3Rotation;
 
 void sampleISR()
 
@@ -103,37 +110,114 @@ void sampleISR()
   static uint32_t phaseAcc = 0;
   phaseAcc += currentStepSize;
   int32_t Vout = (phaseAcc >> 24) - 128;
+  Vout = Vout >> (8 - currentKnob3Rotation);
   analogWrite(OUTR_PIN, Vout + 128);
 }
 
-struct
+class Knob
 {
-  std::bitset<32> inputs;
-} sysState;
+private:
+  uint32_t upperLimit;
+  uint32_t lowerLimit;
+  uint32_t knobIndex;
+  int currentValue = 0;
+  std::bitset<2> prevB3A3 = 0b00;
+  std::bitset<2> B3A3;
+  uint32_t row;
+  std::bitset<4> cols;
+  bool increment = false;
+
+public:
+  Knob(uint32_t _knobIndex, int _upperLimit = INT_MAX, int _lowerLimit = INT_MIN)
+      : knobIndex(_knobIndex), upperLimit(_upperLimit), lowerLimit(_lowerLimit)
+  {
+  }
+
+  void setUpperLimit(int newUpperLimit)
+  {
+    upperLimit = newUpperLimit;
+  }
+
+  void setLowerLimit(int newLowerLimit)
+  {
+    lowerLimit = newLowerLimit;
+  }
+
+  int getCurrentValue()
+  {
+    return currentValue;
+  }
+
+  void updateCurrentValue()
+  {
+    if (knobIndex == 3 || knobIndex == 2)
+      row = 3;
+    else
+      row = 4;
+    setRow(row);
+    delayMicroseconds(3);
+    cols = readCols();
+
+    if (knobIndex == 3 || knobIndex == 1)
+      B3A3 = cols[1] << 1 | cols[0];
+    else
+      B3A3 = cols[3] << 1 | cols[2];
+    if (prevB3A3 == 0b00 && B3A3 == 0b01 || prevB3A3 == 0b11 && B3A3 == 0b10)
+    {
+      currentValue++;
+      increment = true;
+    }
+    else if (prevB3A3 == 0b01 && B3A3 == 0b00 || prevB3A3 == 0b10 && B3A3 == 0b11)
+    {
+      currentValue--;
+      increment = false;
+    }
+    else if (prevB3A3 == 0b11 && B3A3 == 0b00)
+    {
+      currentValue += increment ? 1 : -1;
+    }
+    if (currentValue > upperLimit)
+      currentValue = upperLimit;
+    else if (currentValue < lowerLimit)
+      currentValue = lowerLimit;
+    prevB3A3 = B3A3;
+  }
+};
 
 void scanKeysTask(void *pvParameters)
 {
-  const TickType_t xFrequency = 50 /portTICK_PERIOD_MS;
+  uint8_t TX_Message[8] = {0};
+  const TickType_t xFrequency = 20 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
+  std::bitset<2> prevB3A3 = 0b00;
+  std::bitset<2> B3A3;
+  Knob knob3(3, 8, 0);
+  bool increment = false;
+
+  std::bitset<4> cols;
+  uint32_t localCurrentStepSize;
   while (1)
   {
-    vTaskDelayUntil( &xLastWakeTime, xFrequency );
-
-    std::bitset<4> cols;
-    uint32_t localCurrentStepSize;
-
-    for (int i = 0; i <= 2; i++)
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    for (int row = 0; row <= 3; row++)
     {
 
-      setRow(i);
+      setRow(row);
       delayMicroseconds(3);
       cols = readCols();
-      sysState.inputs[i * 4] = cols[0];
-      sysState.inputs[i * 4 + 1] = cols[1];
-      sysState.inputs[i * 4 + 2] = cols[2];
-      sysState.inputs[i * 4 + 3] = cols[3];
+      sysState.inputs[row * 4] = cols[0];
+      sysState.inputs[row * 4 + 1] = cols[1];
+      sysState.inputs[row * 4 + 2] = cols[2];
+      sysState.inputs[row * 4 + 3] = cols[3];
+      if (row == 3)
+      {
+        knob3.updateCurrentValue();
+        sysState.knob3Rotation = knob3.getCurrentValue();
+        __atomic_store_n(&currentKnob3Rotation, sysState.knob3Rotation, __ATOMIC_RELAXED);
+      }
     }
-    
+
     int idx = -1;
     for (int i = 0; i <= 11; i++)
     {
@@ -142,18 +226,70 @@ void scanKeysTask(void *pvParameters)
         idx = i;
       };
     }
+    xSemaphoreGive(sysState.mutex);
     if (idx == -1)
+    {
       localCurrentStepSize = 0;
+      TX_Message[0] = 'R';
+      TX_Message[1] = 0;
+      TX_Message[2] = 0;
+      CAN_TX(0x123, TX_Message);
+    }
     else
+    {
       localCurrentStepSize = stepSizes[idx];
+      TX_Message[0] = 'P';
+      TX_Message[1] = 4;
+      TX_Message[2] = idx;
+      CAN_TX(0x123, TX_Message);
+    }
     __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
   }
 }
 
+void displayUpdateTask(void *pvParameters)
+{
+  std::vector<String> Keys = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+  uint32_t ID;
+  uint8_t RX_Message[8]={0};
+
+  const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  while (1)
+  {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    int idx = -1;
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    for (int i = 0; i <= 11; i++)
+    {
+      if (sysState.inputs[i] == 0)
+        idx = i;
+    }
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    if (idx == -1)
+      u8g2.drawStr(2, 10, String("No Keys pressed!").c_str());
+    else
+      u8g2.drawStr(2, 10, String(Keys[idx] + " Pressed !").c_str());
+    u8g2.setCursor(2, 20);
+    u8g2.print(sysState.knob3Rotation);
+    while (CAN_CheckRXLevel())
+	    CAN_RX(ID, RX_Message);
+    u8g2.setCursor(66, 30);
+    u8g2.print((char)RX_Message[0]);
+    u8g2.print(RX_Message[1]);
+    u8g2.print(RX_Message[2]);
+	  
+    xSemaphoreGive(sysState.mutex);
+
+    u8g2.sendBuffer();
+    // Toggle LED
+    digitalToggle(LED_BUILTIN);
+  }
+}
 void setup()
 {
   // put your setup code here, to run once:
-
   // Set pin directions
   pinMode(RA0_PIN, OUTPUT);
   pinMode(RA1_PIN, OUTPUT);
@@ -181,43 +317,40 @@ void setup()
   // Initialise UART
   Serial.begin(9600);
   Serial.println("Hello World");
+  // CAN BUS setup CAN_inti = false if u wan to communicate with others
+  CAN_Init(false);
+  setCANFilter(0x123,0x7ff);
+  CAN_Start();
+  // Interrupt timer setup
   TIM_TypeDef *Instance = TIM1;
   HardwareTimer *sampleTimer = new HardwareTimer(Instance);
   sampleTimer->setOverflow(22000, HERTZ_FORMAT);
   sampleTimer->attachInterrupt(sampleISR);
   sampleTimer->resume();
+  // Threading setup
   TaskHandle_t scanKeysHandle = NULL;
   xTaskCreate(
-    scanKeysTask,
-    "scankeys",
-    64,
-    NULL,
-    1,
-    &scanKeysHandle
-  );
+      scanKeysTask,
+      "scankeys",
+      64,
+      NULL,
+      2,
+      &scanKeysHandle);
+  xTaskCreate(
+      displayUpdateTask,
+      "display",
+      256,
+      NULL,
+      1,
+      &scanKeysHandle);
+  sysState.mutex = xSemaphoreCreateMutex();
+  // Start the threading
   vTaskStartScheduler();
-
+  
 }
 
 // dimension of the screen are 128x32
 
 void loop()
 {
-  // put your main code here, to run repeatedly:
-  static uint32_t next = millis();
-  static uint32_t count = 0;
-
-  while (millis() < next)
-    ; // Wait for next interval
-
-  next += interval;
-  
-
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-
-  u8g2.drawStr(2, 20, String("Piano!").c_str());
-  u8g2.sendBuffer();
-  // Toggle LED
-  digitalToggle(LED_BUILTIN);
 }

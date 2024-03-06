@@ -40,7 +40,7 @@ const int HKOW_BIT = 5;
 const int HKOE_BIT = 6;
 
 // Display driver object
-U8G2_SSD1305_128X32_NONAME_F_HW_I2C u8g2(U8G2_R0);
+U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
 
 // Function to set outputs using key matrix
 void setOutMuxBit(const uint8_t bitIdx, const bool value)
@@ -59,10 +59,11 @@ struct
 {
   std::bitset<32> inputs;
   SemaphoreHandle_t mutex;
+  uint8_t RX_Message[8] = {0};
+
   int knob3Rotation = 0;
 } sysState;
 QueueHandle_t msgInQ;
-uint8_t RX_Message[8] = {0};
 
 void setRow(uint8_t x)
 {
@@ -197,17 +198,20 @@ void decodeTask(void *pvParameters)
   // TX_Message[0] = 'R';
   //     TX_Message[1] = 0;
   //     TX_Message[2] = 0;
+  uint8_t localMessage[8] = {0};
   while (1)
   {
-    xQueueReceive(msgInQ, RX_Message, portMAX_DELAY);
-    if (RX_Message[0] == 'R')
+    xQueueReceive(msgInQ, localMessage, portMAX_DELAY);
+    if (localMessage[0] == 'P')
     {
-      __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+
+      __atomic_store_n(&currentStepSize, stepSizes[localMessage[2]] << (localMessage[1] - 4), __ATOMIC_RELAXED);
     }
-    else
-    {
-      __atomic_store_n(&currentStepSize, stepSizes[RX_Message[2]] << (RX_Message[1] - 4), __ATOMIC_RELAXED);
-    }
+
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+    memcpy(sysState.RX_Message, localMessage, sizeof(localMessage));
+    // __atomic_store_n(&currentStepSize, stepSizes[localMessage[2]] << (localMessage[1] - 4), __ATOMIC_RELAXED);
+    xSemaphoreGive(sysState.mutex);
   }
 }
 void scanKeysTask(void *pvParameters)
@@ -255,7 +259,8 @@ void scanKeysTask(void *pvParameters)
     xSemaphoreGive(sysState.mutex);
     if (idx == -1)
     {
-      localCurrentStepSize = 0;
+      if (sysState.RX_Message[0] != 'P')
+        localCurrentStepSize = 0;
       TX_Message[0] = 'R';
       TX_Message[1] = 0;
       TX_Message[2] = 0;
@@ -300,9 +305,9 @@ void displayUpdateTask(void *pvParameters)
     u8g2.print(sysState.knob3Rotation);
 
     u8g2.setCursor(66, 30);
-    u8g2.print((char)RX_Message[0]);
-    u8g2.print(RX_Message[1]);
-    u8g2.print(RX_Message[2]);
+    u8g2.print((char)sysState.RX_Message[0]);
+    u8g2.print(sysState.RX_Message[1]);
+    u8g2.print(sysState.RX_Message[2]);
 
     xSemaphoreGive(sysState.mutex);
 

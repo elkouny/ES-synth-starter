@@ -251,7 +251,7 @@ void displayUpdateTask(void *pvParameters)
 {
   std::vector<String> Keys = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
   uint32_t ID;
-  uint8_t RX_Message[8]={0};
+  uint8_t RX_Message[8] = {0};
 
   const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -274,12 +274,12 @@ void displayUpdateTask(void *pvParameters)
     u8g2.setCursor(2, 20);
     u8g2.print(sysState.knob3Rotation);
     while (CAN_CheckRXLevel())
-	    CAN_RX(ID, RX_Message);
+      CAN_RX(ID, RX_Message);
     u8g2.setCursor(66, 30);
     u8g2.print((char)RX_Message[0]);
     u8g2.print(RX_Message[1]);
     u8g2.print(RX_Message[2]);
-	  
+
     xSemaphoreGive(sysState.mutex);
 
     u8g2.sendBuffer();
@@ -319,7 +319,7 @@ void setup()
   Serial.println("Hello World");
   // CAN BUS setup CAN_inti = false if u wan to communicate with others
   CAN_Init(false);
-  setCANFilter(0x123,0x7ff);
+  setCANFilter(0x123, 0x7ff);
   CAN_Start();
   // Interrupt timer setup
   TIM_TypeDef *Instance = TIM1;
@@ -346,7 +346,6 @@ void setup()
   sysState.mutex = xSemaphoreCreateMutex();
   // Start the threading
   vTaskStartScheduler();
-  
 }
 
 // dimension of the screen are 128x32

@@ -61,6 +61,8 @@ struct
   SemaphoreHandle_t mutex;
   int knob3Rotation = 0;
 } sysState;
+QueueHandle_t msgInQ;
+uint8_t RX_Message[8] = {0};
 
 void setRow(uint8_t x)
 {
@@ -112,6 +114,13 @@ void sampleISR()
   int32_t Vout = (phaseAcc >> 24) - 128;
   Vout = Vout >> (8 - currentKnob3Rotation);
   analogWrite(OUTR_PIN, Vout + 128);
+}
+void CAN_RX_ISR(void)
+{
+  uint8_t RX_Message_ISR[8];
+  uint32_t ID;
+  CAN_RX(ID, RX_Message_ISR);
+  xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
 }
 
 class Knob
@@ -183,7 +192,24 @@ public:
     prevB3A3 = B3A3;
   }
 };
-
+void decodeTask(void *pvParameters)
+{
+  // TX_Message[0] = 'R';
+  //     TX_Message[1] = 0;
+  //     TX_Message[2] = 0;
+  while (1)
+  {
+    xQueueReceive(msgInQ, RX_Message, portMAX_DELAY);
+    if (RX_Message[0] == 'R')
+    {
+      __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+    }
+    else
+    {
+      __atomic_store_n(&currentStepSize, stepSizes[RX_Message[2]] << (RX_Message[1] - 4), __ATOMIC_RELAXED);
+    }
+  }
+}
 void scanKeysTask(void *pvParameters)
 {
   uint8_t TX_Message[8] = {0};
@@ -251,7 +277,6 @@ void displayUpdateTask(void *pvParameters)
 {
   std::vector<String> Keys = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
   uint32_t ID;
-  uint8_t RX_Message[8] = {0};
 
   const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -273,8 +298,7 @@ void displayUpdateTask(void *pvParameters)
       u8g2.drawStr(2, 10, String(Keys[idx] + " Pressed !").c_str());
     u8g2.setCursor(2, 20);
     u8g2.print(sysState.knob3Rotation);
-    while (CAN_CheckRXLevel())
-      CAN_RX(ID, RX_Message);
+
     u8g2.setCursor(66, 30);
     u8g2.print((char)RX_Message[0]);
     u8g2.print(RX_Message[1]);
@@ -318,7 +342,9 @@ void setup()
   Serial.begin(9600);
   Serial.println("Hello World");
   // CAN BUS setup CAN_inti = false if u wan to communicate with others
+  msgInQ = xQueueCreate(36, 8);
   CAN_Init(false);
+  CAN_RegisterRX_ISR(CAN_RX_ISR);
   setCANFilter(0x123, 0x7ff);
   CAN_Start();
   // Interrupt timer setup
@@ -334,11 +360,18 @@ void setup()
       "scankeys",
       64,
       NULL,
-      2,
+      3,
       &scanKeysHandle);
   xTaskCreate(
       displayUpdateTask,
       "display",
+      256,
+      NULL,
+      2,
+      &scanKeysHandle);
+  xTaskCreate(
+      decodeTask,
+      "decode",
       256,
       NULL,
       1,

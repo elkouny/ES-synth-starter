@@ -64,6 +64,8 @@ struct
   int knob3Rotation = 0;
 } sysState;
 QueueHandle_t msgInQ;
+QueueHandle_t msgOutQ;
+SemaphoreHandle_t CAN_TX_Semaphore;
 
 void setRow(uint8_t x)
 {
@@ -124,6 +126,21 @@ void CAN_RX_ISR(void)
   xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
 }
 
+void CAN_TX_Task(void *pvParameters)
+{
+  uint8_t msgOut[8];
+  while (1)
+  {
+    xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
+    xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY);
+    CAN_TX(0x123, msgOut);
+  }
+}
+
+void CAN_TX_ISR(void)
+{
+  xSemaphoreGiveFromISR(CAN_TX_Semaphore, NULL);
+}
 class Knob
 {
 private:
@@ -223,12 +240,14 @@ void scanKeysTask(void *pvParameters)
   std::bitset<2> B3A3;
   Knob knob3(3, 8, 0);
   bool increment = false;
+  std::vector<int> indexes;
 
   std::bitset<4> cols;
   uint32_t localCurrentStepSize;
   while (1)
   {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    indexes = {};
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     for (int row = 0; row <= 3; row++)
     {
@@ -248,39 +267,42 @@ void scanKeysTask(void *pvParameters)
       }
     }
 
-    int idx = -1;
     for (int i = 0; i <= 11; i++)
     {
       if (sysState.inputs[i] == 0)
       {
-        idx = i;
+        indexes.push_back(i);
       };
     }
     xSemaphoreGive(sysState.mutex);
-    if (idx == -1)
+    if (indexes.size() == 0)
     {
       if (sysState.RX_Message[0] != 'P')
+      {
         localCurrentStepSize = 0;
+        __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+      }
       TX_Message[0] = 'R';
       TX_Message[1] = 0;
       TX_Message[2] = 0;
-      CAN_TX(0x123, TX_Message);
+      xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
     }
     else
     {
-      localCurrentStepSize = stepSizes[idx];
+      localCurrentStepSize = stepSizes[indexes[0]];
       TX_Message[0] = 'P';
       TX_Message[1] = 4;
-      TX_Message[2] = idx;
-      CAN_TX(0x123, TX_Message);
+      TX_Message[2] = indexes[0];
+      xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
+      __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
     }
-    __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
   }
 }
 
 void displayUpdateTask(void *pvParameters)
 {
   std::vector<String> Keys = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+  String Pressed;
   uint32_t ID;
 
   const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
@@ -288,19 +310,20 @@ void displayUpdateTask(void *pvParameters)
   while (1)
   {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    Pressed = "";
     int idx = -1;
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     for (int i = 0; i <= 11; i++)
     {
       if (sysState.inputs[i] == 0)
-        idx = i;
+        Pressed += (" " + (Keys[i]));
     }
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_ncenB08_tr);
-    if (idx == -1)
+    if (Pressed.length() == 0)
       u8g2.drawStr(2, 10, String("No Keys pressed!").c_str());
     else
-      u8g2.drawStr(2, 10, String(Keys[idx] + " Pressed !").c_str());
+      u8g2.drawStr(2, 10, String(Pressed + " Pressed !").c_str());
     u8g2.setCursor(2, 20);
     u8g2.print(sysState.knob3Rotation);
 
@@ -346,10 +369,13 @@ void setup()
   // Initialise UART
   Serial.begin(9600);
   Serial.println("Hello World");
-  // CAN BUS setup CAN_inti = false if u wan to communicate with others
+  msgOutQ = xQueueCreate(36, 8);
   msgInQ = xQueueCreate(36, 8);
+  CAN_TX_Semaphore = xSemaphoreCreateCounting(3, 3);
+  // CAN BUS setup CAN_inti = false if u wan to communicate with others
   CAN_Init(false);
   CAN_RegisterRX_ISR(CAN_RX_ISR);
+  CAN_RegisterTX_ISR(CAN_TX_ISR);
   setCANFilter(0x123, 0x7ff);
   CAN_Start();
   // Interrupt timer setup
@@ -380,6 +406,13 @@ void setup()
       256,
       NULL,
       1,
+      &scanKeysHandle);
+    xTaskCreate(
+      CAN_TX_Task,
+      "Tx Queue",
+      256,
+      NULL,
+      4,
       &scanKeysHandle);
   sysState.mutex = xSemaphoreCreateMutex();
   // Start the threading

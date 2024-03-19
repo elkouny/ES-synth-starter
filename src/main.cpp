@@ -7,7 +7,8 @@
 #include <vector>
 #include <STM32FreeRTOS.h>
 #include <ES_CAN.h>
-
+#define DISABLE_THREADS
+#define TEST_SCANKEYS
 // Constants
 const uint32_t interval = 100; // Display update interval
 
@@ -212,9 +213,6 @@ public:
 };
 void decodeTask(void *pvParameters)
 {
-  // TX_Message[0] = 'R';
-  //     TX_Message[1] = 0;
-  //     TX_Message[2] = 0;
   uint8_t localMessage[8] = {0};
   while (1)
   {
@@ -227,7 +225,6 @@ void decodeTask(void *pvParameters)
 
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     memcpy(sysState.RX_Message, localMessage, sizeof(localMessage));
-    // __atomic_store_n(&currentStepSize, stepSizes[localMessage[2]] << (localMessage[1] - 4), __ATOMIC_RELAXED);
     xSemaphoreGive(sysState.mutex);
   }
 }
@@ -244,6 +241,15 @@ void scanKeysTask(void *pvParameters)
 
   std::bitset<4> cols;
   uint32_t localCurrentStepSize;
+#ifdef TEST_SCANKEYS
+  for (int i = 0; i <= 11; i++)
+  {
+    TX_Message[0] = 'P';
+    TX_Message[1] = 0;
+    TX_Message[2] = 0;
+    xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
+  }
+#else
   while (1)
   {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -297,6 +303,7 @@ void scanKeysTask(void *pvParameters)
       __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
     }
   }
+#endif
 }
 
 void displayUpdateTask(void *pvParameters)
@@ -339,6 +346,7 @@ void displayUpdateTask(void *pvParameters)
     digitalToggle(LED_BUILTIN);
   }
 }
+
 void setup()
 {
   // put your setup code here, to run once:
@@ -369,22 +377,29 @@ void setup()
   // Initialise UART
   Serial.begin(9600);
   Serial.println("Hello World");
-  msgOutQ = xQueueCreate(36, 8);
+
+  // CAN Bus setup with queues
+  msgOutQ = xQueueCreate(384, 8);
   msgInQ = xQueueCreate(36, 8);
   CAN_TX_Semaphore = xSemaphoreCreateCounting(3, 3);
-  // CAN BUS setup CAN_inti = false if u wan to communicate with others
   CAN_Init(false);
   CAN_RegisterRX_ISR(CAN_RX_ISR);
   CAN_RegisterTX_ISR(CAN_TX_ISR);
   setCANFilter(0x123, 0x7ff);
   CAN_Start();
-  // Interrupt timer setup
+
+// Interrupt timer setup
+#ifndef DISABLE_THREADS
   TIM_TypeDef *Instance = TIM1;
   HardwareTimer *sampleTimer = new HardwareTimer(Instance);
   sampleTimer->setOverflow(22000, HERTZ_FORMAT);
   sampleTimer->attachInterrupt(sampleISR);
   sampleTimer->resume();
-  // Threading setup
+#endif
+
+  sysState.mutex = xSemaphoreCreateMutex();
+// Threading setup
+#ifndef DISABLE_THREADS
   TaskHandle_t scanKeysHandle = NULL;
   xTaskCreate(
       scanKeysTask,
@@ -407,16 +422,29 @@ void setup()
       NULL,
       1,
       &scanKeysHandle);
-    xTaskCreate(
+  xTaskCreate(
       CAN_TX_Task,
       "Tx Queue",
       256,
       NULL,
       4,
       &scanKeysHandle);
-  sysState.mutex = xSemaphoreCreateMutex();
+
   // Start the threading
+
   vTaskStartScheduler();
+#endif
+
+#ifdef TEST_SCANKEYS
+  uint32_t startTime = micros();
+  for (int iter = 0; iter < 32; iter++)
+  {
+    scanKeysTask(NULL);
+  }
+  Serial.println(micros() - startTime);
+  while (1)
+    ;
+#endif
 }
 
 // dimension of the screen are 128x32
